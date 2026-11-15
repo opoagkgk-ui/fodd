@@ -1,13 +1,14 @@
 import asyncio
 import logging
 import os
+import re
 import secrets
 import string
 from datetime import datetime, timezone
 
 import aiohttp
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -307,11 +308,13 @@ router.callback_query.middleware(BanMiddleware())
 
 
 async def send_file(target: Message, lang: str):
-    file_id = await get_setting("file_id")
+    """Файл для инвайтной (платной) версии."""
+    file_id = await get_setting("paid_file_id") or await get_setting("file_id")
     if not file_id:
         await target.answer(tr(lang, "nofile"))
         return
-    await target.answer_document(file_id, caption=tr(lang, "ok"), protect_content=True)
+    caption = await get_setting("paid_caption") or tr(lang, "ok")
+    await target.answer_document(file_id, caption=caption, protect_content=True)
     await target.answer(tr(lang, "menu"), reply_markup=menu_kb(lang))
 
 
@@ -335,8 +338,14 @@ async def set_lang(c: CallbackQuery):
 @router.callback_query(F.data == "dont")
 async def dont(c: CallbackQuery):
     u = await get_user(c.from_user.id)
-    await c.message.answer(tr(u["lang"] if u else "ru", "free"))
+    lang = u["lang"] if u else "ru"
     await c.answer()
+    file_id = await get_setting("free_file_id")
+    if not file_id:
+        await c.message.answer(tr(lang, "free"))
+        return
+    caption = await get_setting("free_caption")
+    await c.message.answer_document(file_id, caption=caption or None)
 
 
 @router.callback_query(F.data == "have")
@@ -409,13 +418,51 @@ def is_owner(user_id: int) -> bool:
 @router.message(Command("admin"), F.from_user.id == OWNER_ID)
 async def admin_panel(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("🛠 Админ-панель", reply_markup=admin_kb)
+    await m.answer(
+        "🛠 Админ-панель\n\n"
+        "Файлы (отправь документ с такой подписью):\n"
+        "• /setpaid текст — файл для тех, у кого есть инвайт\n"
+        "• /setfree текст — файл для кнопки «нет инвайта»\n"
+        "Текст после команды станет подписью к файлу.\n\n"
+        "Только подпись, без перезаливки файла:\n"
+        "• /paidcaption текст\n"
+        "• /freecaption текст\n"
+        "(без текста — сбросить подпись)",
+        reply_markup=admin_kb,
+    )
 
 
-@router.message(F.from_user.id == OWNER_ID, F.document, F.caption.startswith("/setfile"))
+SETFILE_RE = re.compile(r"^/(setpaid|setfree|setfile)(?:@\w+)?(?:\s+(.*))?$", re.S)
+
+
+@router.message(
+    F.from_user.id == OWNER_ID,
+    F.document,
+    F.caption.regexp(r"^/(setpaid|setfree|setfile)(@\w+)?(\s|$)"),
+)
 async def set_file(m: Message):
-    await set_setting("file_id", m.document.file_id)
-    await m.answer(f"✅ Файл сохранён: {m.document.file_name}\nТеперь его получают пользователи с инвайтом.")
+    """Документ с подписью '/setpaid текст' или '/setfree текст'.
+    Текст после команды становится подписью к файлу."""
+    match = SETFILE_RE.match(m.caption.strip())
+    cmd = match.group(1)
+    caption = (match.group(2) or "").strip()
+    kind = "free" if cmd == "setfree" else "paid"
+    await set_setting(f"{kind}_file_id", m.document.file_id)
+    await set_setting(f"{kind}_caption", caption)
+    who = "бесплатной версии (кнопка «нет инвайта»)" if kind == "free" else "инвайтной версии"
+    await m.answer(
+        f"✅ Файл для {who} сохранён: {m.document.file_name}\n"
+        f"Подпись: {caption or '— (по умолчанию)' if kind == 'paid' else caption or '— (без подписи)'}"
+    )
+
+
+@router.message(Command("paidcaption", "freecaption"), F.from_user.id == OWNER_ID)
+async def set_caption(m: Message, command: CommandObject):
+    """Поменять только подпись, не загружая файл заново. Без текста — сбросить."""
+    kind = "free" if command.command == "freecaption" else "paid"
+    text = (command.args or "").strip()
+    await set_setting(f"{kind}_caption", text)
+    await m.answer("✅ Подпись обновлена." if text else "✅ Подпись сброшена.")
 
 
 @router.callback_query(F.data.startswith("adm:"), F.from_user.id == OWNER_ID)
